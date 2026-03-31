@@ -1,4 +1,4 @@
-%% Detection + Tracking + Lamppost Extension + Merge/Split Display
+%% Detection + Tracking + Kalman Filter + Merge/Split Display
 clear; close all; clc;
 
 %% PARAMETERS
@@ -22,6 +22,19 @@ numBins = 16;
 maxMissing = 40;
 nextID = 1;
 
+%% KALMAN PARAMETERS
+% State: [x; y; vx; vy]   Measurement: [x; y]
+dt = 1;  % one frame step
+F = [1 0 dt 0;    % state transition
+     0 1 0  dt;
+     0 0 1  0;
+     0 0 0  1];
+Hobs = [1 0 0 0;  % observation matrix (named Hobs to avoid conflict with image height H)
+        0 1 0 0];
+Q = diag([4, 4, 2, 2]);      % process noise (allows moderate acceleration)
+R = diag([9, 9]);             % measurement noise (detection centroid jitter)
+P0 = diag([10, 10, 25, 25]); % initial state covariance
+
 %% PATHS
 imgDir = fullfile('Crowd_PETS','S2','L1','Time_12-34','View_001');
 nFrames = 795;
@@ -41,8 +54,11 @@ end
 bgModel = median(bgStack, 3);
 
 %% TRACK MEMORY
+% Each track now carries Kalman state (kf_x), covariance (kf_P), and predicted position
 tracks = struct('id',{},'centroid',{},'bbox',{},'hueHist',{}, ...
-                'lastSeen',{},'isMissing',{},'stillInFrame',{},'missingCount',{});
+                'lastSeen',{},'isMissing',{},'stillInFrame',{},'missingCount',{}, ...
+                'confirmedCount',{}, ...
+                'kf_x',{},'kf_P',{},'predictedCentroid',{});
 prevTracks = struct('id',{},'centroid',{},'bbox',{},'displayIDs',{},'pixelIdx',{},'area',{});
 prevMergedBoxes = struct('bbox',{},'displayIDs',{});
 
@@ -66,6 +82,13 @@ for f = 1:nFrames
 
     %% LAMPPOST EXTENSION
     fgMask = extendShortBlobsAtSign(fgMask);
+
+    %% KALMAN PREDICT — run for ALL tracks before matching
+    for t = 1:length(tracks)
+        tracks(t).kf_x = F * tracks(t).kf_x;
+        tracks(t).kf_P = F * tracks(t).kf_P * F' + Q;
+        tracks(t).predictedCentroid = [tracks(t).kf_x(1), tracks(t).kf_x(2)];
+    end
 
     %% BLOBS
     stats = regionprops(fgMask, 'BoundingBox', 'Area', 'Centroid', 'PixelIdxList');
@@ -107,9 +130,7 @@ for f = 1:nFrames
     stats = stats(validMask);
 
     currentTracks = struct('id',{},'centroid',{},'bbox',{},'displayIDs',{},'pixelIdx',{},'area',{});
-    usedTrackIdx = [];
     usedDisplayIDs = [];
-    usedPrevMergedIdx = [];
 
     %% DISPLAY SETUP
     subplot(1,2,1);
@@ -120,60 +141,135 @@ for f = 1:nFrames
     imshow(img);
     hold on;
 
-    %% MATCH DETECTIONS TO TRACKS
-    for j = 1:length(stats)
+    %% MATCH DETECTIONS TO TRACKS (Hungarian algorithm + Kalman predicted positions)
+    nDets = length(stats);
+    nTrks = length(tracks);
 
-        bb = stats(j).BoundingBox;
-        ct = stats(j).Centroid;
-        hHist = getHueHist(img, bb, numBins);
+    % Precompute detection features
+    detBB   = zeros(nDets, 4);
+    detCt   = zeros(nDets, 2);
+    detHist = zeros(nDets, numBins);
+    for j = 1:nDets
+        detBB(j,:)    = stats(j).BoundingBox;
+        detCt(j,:)    = stats(j).Centroid;
+        detHist(j,:)  = getHueHist(img, detBB(j,:), numBins, stats(j).PixelIdxList);
+    end
 
-        bestID = -1;
-        bestScore = inf;
-        bestTrackIdx = -1;
-        
-        for t = 1:length(tracks)
-            if ismember(t, usedTrackIdx)
+    % Build cost matrix (detections x tracks)
+    costMatrix = inf(nDets, nTrks);
+    maxAssignCost = 200;
+
+    for j = 1:nDets
+        bb = detBB(j,:);
+        ct = detCt(j,:);
+        hHist = detHist(j,:);
+
+        % Adaptive distance gate based on vertical position
+        yBottom = bb(2) + bb(4);
+        alphaPos = min(max(yBottom / H, 0), 1);
+        maxDist = 50 + 80 * alphaPos;
+
+        for t = 1:nTrks
+            % Skip tracks missing for too long
+            if tracks(t).isMissing && tracks(t).missingCount > 5
                 continue;
             end
-        
-            dist = norm(ct - tracks(t).centroid);
+
+            % Use PREDICTED centroid from Kalman filter (not last-seen position)
+            predCt = tracks(t).predictedCentroid;
+            dist = norm(ct - predCt);
+            if dist > maxDist
+                continue;
+            end
+
+            % Hue histogram difference
             hueDiff = sum(abs(hHist - tracks(t).hueHist));
-            score = dist + 80*hueDiff;
-        
-            if score < bestScore && dist < 80
-                bestScore = score;
-                bestID = tracks(t).id;
-                bestTrackIdx = t;
+            if tracks(t).confirmedCount >= 3
+                hueWeight = 120;
+            else
+                hueWeight = 60;
+            end
+
+            % Size similarity
+            detArea = bb(3) * bb(4);
+            trkArea = tracks(t).bbox(3) * tracks(t).bbox(4);
+            sizeRatio = max(detArea, trkArea) / max(min(detArea, trkArea), 1);
+            sizePenalty = 15 * (sizeRatio - 1);
+
+            cost = dist + hueWeight * hueDiff + sizePenalty;
+
+            if cost < maxAssignCost
+                costMatrix(j, t) = cost;
             end
         end
-        
-        if bestID == -1
-            % New person
+    end
+
+    % Hungarian assignment
+    if nDets > 0 && nTrks > 0
+        assignments = matchpairs(costMatrix, maxAssignCost);
+    else
+        assignments = zeros(0, 2);
+    end
+
+    assignedDets = assignments(:,1);
+    assignedTrks = assignments(:,2);
+
+    % Process all detections
+    for j = 1:nDets
+        bb    = detBB(j,:);
+        ct    = detCt(j,:);
+        hHist = detHist(j,:);
+
+        aIdx = find(assignedDets == j, 1);
+
+        if isempty(aIdx)
+            % Unmatched detection -> new person
             id = nextID;
             nextID = nextID + 1;
-        
-            tracks(end+1).id = id;
-            tracks(end).centroid = ct;
-            tracks(end).bbox = bb;
-            tracks(end).hueHist = hHist;
-            tracks(end).lastSeen = f;
-            tracks(end).isMissing = false;
-            tracks(end).stillInFrame = true;
-            tracks(end).missingCount = 0;
-        
+
+            newIdx = length(tracks) + 1;
+            tracks(newIdx).id = id;
+            tracks(newIdx).centroid = ct;
+            tracks(newIdx).bbox = bb;
+            tracks(newIdx).hueHist = hHist;
+            tracks(newIdx).lastSeen = f;
+            tracks(newIdx).isMissing = false;
+            tracks(newIdx).stillInFrame = true;
+            tracks(newIdx).missingCount = 0;
+            tracks(newIdx).confirmedCount = 1;
+
+            % Initialize Kalman state: position = centroid, velocity = 0
+            tracks(newIdx).kf_x = [ct(1); ct(2); 0; 0];
+            tracks(newIdx).kf_P = P0;
+            tracks(newIdx).predictedCentroid = ct;
         else
-            % Re-identified person
-            id = bestID;
-        
-            tracks(bestTrackIdx).centroid = ct;
-            tracks(bestTrackIdx).bbox = bb;
-            tracks(bestTrackIdx).hueHist = 0.8 * tracks(bestTrackIdx).hueHist + 0.2 * hHist;
-            tracks(bestTrackIdx).lastSeen = f;
-            tracks(bestTrackIdx).isMissing = false;
-            tracks(bestTrackIdx).stillInFrame = true;
-            tracks(bestTrackIdx).missingCount = 0;
-        
-            usedTrackIdx(end+1) = bestTrackIdx; %#ok<SAGROW>
+            % Matched -> re-identified person
+            tIdx = assignedTrks(aIdx);
+            id = tracks(tIdx).id;
+
+            % Kalman UPDATE step: correct prediction with measurement
+            z = [ct(1); ct(2)];
+            S = Hobs * tracks(tIdx).kf_P * Hobs' + R;
+            K = tracks(tIdx).kf_P * Hobs' / S;
+            tracks(tIdx).kf_x = tracks(tIdx).kf_x + K * (z - Hobs * tracks(tIdx).kf_x);
+            tracks(tIdx).kf_P = (eye(4) - K * Hobs) * tracks(tIdx).kf_P;
+
+            % Use filtered position as centroid
+            tracks(tIdx).centroid = [tracks(tIdx).kf_x(1), tracks(tIdx).kf_x(2)];
+            tracks(tIdx).bbox = bb;
+            tracks(tIdx).confirmedCount = tracks(tIdx).confirmedCount + 1;
+
+            if tracks(tIdx).confirmedCount <= 3
+                hueAlpha = 0.5;
+            else
+                hueAlpha = 0.2;
+            end
+            tracks(tIdx).hueHist = (1-hueAlpha) * tracks(tIdx).hueHist + hueAlpha * hHist;
+
+            tracks(tIdx).lastSeen = f;
+            tracks(tIdx).isMissing = false;
+            tracks(tIdx).stillInFrame = true;
+            tracks(tIdx).missingCount = 0;
         end
 
         %% SAVE CURRENT TRACK
@@ -187,62 +283,72 @@ for f = 1:nFrames
         %% MERGE / SPLIT DISPLAY IDS
         currPixelIdx = stats(j).PixelIdxList;
         currArea = stats(j).Area;
-        
-        displayIDs = resolveDisplayIDsFromMaskOverlap(currPixelIdx, currArea, bb, id, prevTracks);
-        
-        % persistent merged display from previous frame, but each previous merged box
-        % can only be used once per frame
+
+        % Default: display the tracker ID
+        displayIDs = id;
+
+        % Check for merge
+        if ~isempty(prevTracks)
+            mergeIDs = resolveDisplayIDsFromMaskOverlap(currPixelIdx, currArea, bb, id, prevTracks);
+
+            if numel(mergeIDs) >= 2
+                displayIDs = mergeIDs;
+            end
+        end
+
+        % Split recovery using hue similarity
         if numel(displayIDs) == 1
             bestM = 0;
             bestIoU = 0;
-        
+
             for m = 1:numel(prevMergedBoxes)
-                if ismember(m, usedPrevMergedIdx)
-                    continue;
-                end
-        
                 ov = bboxIoU(bb, prevMergedBoxes(m).bbox);
-                if ov > 0.25 && numel(prevMergedBoxes(m).displayIDs) >= 2 && ov > bestIoU
+                mergedArea = prevMergedBoxes(m).bbox(3) * prevMergedBoxes(m).bbox(4);
+                blobArea = bb(3) * bb(4);
+                if ov > 0.15 && numel(prevMergedBoxes(m).displayIDs) >= 2 ...
+                        && ov > bestIoU && blobArea < 0.85 * mergedArea
                     bestIoU = ov;
                     bestM = m;
                 end
             end
-        
+
             if bestM > 0
                 prevIDs = prevMergedBoxes(bestM).displayIDs;
-                prevBox = prevMergedBoxes(bestM).bbox;
-        
-                % Simple split handling for 2-person merges:
-                % left child gets left old ID, right child gets right old ID
-                if numel(prevIDs) == 2
-                    prevIDs = orderIDsByPreviousX(prevIDs, prevTracks);
-        
-                    oldMidX = prevBox(1) + prevBox(3)/2;
-                    newMidX = bb(1) + bb(3)/2;
-        
-                    if newMidX < oldMidX
-                        displayIDs = prevIDs(1);
-                    else
-                        displayIDs = prevIDs(2);
+
+                % Also use Kalman predicted positions for split assignment
+                % Pick the ID whose predicted centroid is closest to this blob
+                predDists = inf(1, numel(prevIDs));
+                histDiffs = inf(1, numel(prevIDs));
+                for pi = 1:numel(prevIDs)
+                    tIdx = find([tracks.id] == prevIDs(pi), 1);
+                    if ~isempty(tIdx)
+                        histDiffs(pi) = sum(abs(hHist - tracks(tIdx).hueHist));
+                        predDists(pi) = norm(ct - tracks(tIdx).predictedCentroid);
                     end
-                else
-                    displayIDs = prevIDs;
                 end
-        
-                usedPrevMergedIdx(end+1) = bestM; %#ok<SAGROW>
+
+                % Combined score: Kalman position + hue similarity
+                splitScores = predDists + 80 * histDiffs;
+                [~, sortOrder] = sort(splitScores);
+                rankedIDs = prevIDs(sortOrder);
+
+                for pi = 1:numel(rankedIDs)
+                    if ~ismember(rankedIDs(pi), usedDisplayIDs)
+                        displayIDs = rankedIDs(pi);
+                        break;
+                    end
+                end
             end
         end
-        
+
         % Order merged IDs left-to-right
         if numel(displayIDs) >= 2
             displayIDs = orderIDsByPreviousX(displayIDs, prevTracks);
         end
-        
+
         % ---------- Enforce per-frame display uniqueness ----------
         if numel(displayIDs) == 1
-            % Single ID cannot appear twice in same frame
             if ismember(displayIDs, usedDisplayIDs)
-                % Fallback: use the tracker ID if unused, otherwise allocate a new ID
                 if ~ismember(id, usedDisplayIDs)
                     displayIDs = id;
                 else
@@ -251,10 +357,8 @@ for f = 1:nFrames
                 end
             end
         else
-            % Remove any IDs already consumed by earlier blobs this frame
             displayIDs = displayIDs(~ismember(displayIDs, usedDisplayIDs));
-        
-            % If all IDs were already used, fallback to tracker ID or new ID
+
             if isempty(displayIDs)
                 if ~ismember(id, usedDisplayIDs)
                     displayIDs = id;
@@ -264,10 +368,9 @@ for f = 1:nFrames
                 end
             end
         end
-        
-        % Mark display IDs as used in this frame
+
         usedDisplayIDs = [usedDisplayIDs, displayIDs];
-        
+
         circleCenters = makeCircleCenters(bb, numel(displayIDs));
         currentTracks(k).displayIDs = displayIDs;
 
@@ -302,22 +405,45 @@ for f = 1:nFrames
              'FontWeight', 'bold', ...
              'BackgroundColor', 'black');
     end
-    %% Mark unmatches blobs
+
+    %% MARK UNMATCHED TRACKS
     edgeMargin = 25;
+    maxMissingHard = 60;
+
+    % Collect IDs inside merged blobs — these tracks are not missing
+    mergedIDs = [];
+    for q = 1:numel(currentTracks)
+        if numel(currentTracks(q).displayIDs) >= 2
+            mergedIDs = [mergedIDs, currentTracks(q).displayIDs]; %#ok<AGROW>
+        end
+    end
 
     for t = 1:length(tracks)
-        if tracks(t).lastSeen < f   % not matched this frame
+        if tracks(t).lastSeen < f   % not directly matched this frame
+
+            % Track is inside a merge — keep alive, Kalman keeps predicting
+            if ismember(tracks(t).id, mergedIDs)
+                tracks(t).isMissing = false;
+                tracks(t).missingCount = 0;
+                tracks(t).stillInFrame = true;
+                % NOTE: Kalman predict already ran at top of frame, so
+                % predictedCentroid reflects where this person should be
+                % even though they're inside a merged blob. No position
+                % override needed — the Kalman velocity carries them forward.
+                continue;
+            end
+
             tracks(t).isMissing = true;
             tracks(t).missingCount = tracks(t).missingCount + 1;
-    
+
             bb = tracks(t).bbox;
             x = bb(1); y = bb(2); w = bb(3); h = bb(4);
-    
+
             touchesEdge = (x <= edgeMargin) || ...
                           (y <= edgeMargin) || ...
                           (x + w >= W - edgeMargin) || ...
                           (y + h >= H - edgeMargin);
-    
+
             if touchesEdge
                 tracks(t).stillInFrame = false;
             else
@@ -328,15 +454,16 @@ for f = 1:nFrames
 
     %% REMOVE OLD TRACKS
     keep = true(1, length(tracks));
-    
+
     for t = 1:length(tracks)
-        tooOld = tracks(t).missingCount > maxMissing;
-    
-        if tooOld && ~tracks(t).stillInFrame
+        missingTooLong = tracks(t).missingCount > maxMissingHard;
+        leftScene = tracks(t).missingCount > maxMissing && ~tracks(t).stillInFrame;
+
+        if missingTooLong || leftScene
             keep(t) = false;
         end
     end
-    
+
     tracks = tracks(keep);
 
     %% SAVE MERGED BOX MEMORY

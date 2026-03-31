@@ -1,4 +1,13 @@
-function hHist = getHueHist(img, bbox, numBins)
+function hHist = getHueHist(img, bbox, numBins, pixelIdx)
+% Compute a hue histogram over foreground pixels only.
+%
+% img       - RGB image (H x W x 3, uint8)
+% bbox      - [x y w h] bounding box
+% numBins   - number of histogram bins
+% pixelIdx  - linear indices of foreground pixels (from PixelIdxList)
+%
+% If pixelIdx is provided, only those pixels are used (masked to bbox).
+% This prevents background colors from contaminating the histogram.
 
 x = max(1, floor(bbox(1)));
 y = max(1, floor(bbox(2)));
@@ -13,21 +22,39 @@ if x2 <= x || y2 <= y
     return;
 end
 
-patch = img(y:y2, x:x2, :);
-hsv = rgb2hsv(patch);
+% Convert full image to HSV
+hsvImg = rgb2hsv(img);
 
-H = hsv(:,:,1);
-S = hsv(:,:,2);
+[imgH, imgW, ~] = size(img);
 
-mask = S > 0.2;
-hVals = H(mask);
+if nargin >= 4 && ~isempty(pixelIdx)
+    % Build a mask from PixelIdxList (linear indices into H x W image)
+    fgMask = false(imgH, imgW);
+    fgMask(pixelIdx) = true;
+
+    % Crop to bounding box region
+    fgPatch = fgMask(y:y2, x:x2);
+    hPatch  = hsvImg(y:y2, x:x2, 1);
+    sPatch  = hsvImg(y:y2, x:x2, 2);
+    vPatch  = hsvImg(y:y2, x:x2, 3);
+
+    % Only use foreground pixels with sufficient saturation and brightness
+    mask = fgPatch & (sPatch > 0.15) & (vPatch > 0.15);
+else
+    % Fallback: use all pixels in bbox (original behavior)
+    hPatch = hsvImg(y:y2, x:x2, 1);
+    sPatch = hsvImg(y:y2, x:x2, 2);
+    vPatch = hsvImg(y:y2, x:x2, 3);
+
+    mask = (sPatch > 0.15) & (vPatch > 0.15);
+end
+
+hVals = hPatch(mask);
 
 if isempty(hVals)
     hHist = zeros(1,numBins);
     return;
 end
-
-%hey
 
 edges = linspace(0,1,numBins+1);
 hHist = histcounts(hVals, edges, 'Normalization','probability');
